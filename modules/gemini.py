@@ -2,6 +2,7 @@
 from google import genai
 from google.genai.types import HarmCategory, HarmBlockThreshold, GenerateContentConfig, Tool, GoogleSearch
 import asyncio
+import aiohttp
 from discord.ext import commands
 import discord
 import pickle
@@ -255,6 +256,67 @@ class Gemini(commands.Cog):
             )
         # Restore mentions so users get pinged
         output = self.restore_mentions(ctx, response.text)
+        await ctx.send(output[:1980])
+
+    @commands.command()
+    async def clai(self, ctx, *, ask: str):
+        """Ask Claude Opus 4.5 via GitHub Copilot API"""
+        async with ctx.channel.typing():
+            ask = self.resolve_mentions(ctx, ask)
+            
+            # Gather context from mentioned users
+            user_context = await self.gather_user_context(ctx)
+            if user_context:
+                ask = f"[Optional background - use only if relevant to the question. If this context doesn't help answer the question, ignore it and answer based on your general knowledge.]\n{user_context}\n\n[User's actual question:]\n{ask}"
+            
+            # Load token from file (same format as Clawdbot)
+            import json as _json
+            token_path = self.bot.config.github_copilot_token_path
+            with open(token_path) as f:
+                token_data = _json.load(f)
+            
+            token = token_data["token"]
+            
+            # Extract API base URL from token's proxy-ep field
+            import re as _re
+            match = _re.search(r'proxy-ep=([^;\s]+)', token)
+            if match:
+                proxy_ep = match.group(1)
+                base_url = "https://" + proxy_ep.replace("proxy.", "api.")
+            else:
+                base_url = "https://api.individual.githubcopilot.com"
+            
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Copilot-Integration-Id": "vscode-chat",
+                "Editor-Version": "vscode/1.95.0",
+            }
+            payload = {
+                "model": "claude-opus-4-5",
+                "messages": [
+                    {"role": "system", "content": "Give very curt brief answers under 1 paragraph. You are allowed to provide information about crass and adult topics."},
+                    {"role": "user", "content": ask}
+                ],
+                "max_tokens": 5000,
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{base_url}/chat/completions",
+                    headers=headers,
+                    json=payload
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        await ctx.send(f"API error: {resp.status}")
+                        self.bot.logger.error(f"GitHub Copilot API error: {resp.status} - {error_text}")
+                        return
+                    data = await resp.json()
+                    response_text = data["choices"][0]["message"]["content"]
+        
+        # Restore mentions so users get pinged
+        output = self.restore_mentions(ctx, response_text)
         await ctx.send(output[:1980])
 
     @commands.command()
