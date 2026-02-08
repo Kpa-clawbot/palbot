@@ -613,13 +613,18 @@ RULES:
                     usage = data.get("usage", {})
                     in_tok = usage.get("prompt_tokens", estimate_tokens(ask))
                     out_tok = usage.get("completion_tokens", estimate_tokens(response_text))
+                    cached_tok = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
                     await self.ai_cache.log_usage(
                         ctx.channel.id, ctx.guild.id, "clai",
                         in_tok, out_tok, answer_model)
 
                     if show_debug:
                         debug_parts.append(f"in={in_tok}")
+                        if cached_tok:
+                            debug_parts.append(f"cached={cached_tok}")
                         debug_parts.append(f"out={out_tok}")
+                        cost = calculate_cost(answer_model, in_tok, out_tok, cached_tok)
+                        debug_parts.append(f"${cost:.4f}")
                         debug_parts.append(answer_model.split("-")[1] if "-" in answer_model else answer_model)
 
         # Restore mentions so users get pinged
@@ -813,13 +818,18 @@ RULES:
                     usage = data.get("usage", {})
                     in_tok = usage.get("prompt_tokens", estimate_tokens(ask))
                     out_tok = usage.get("completion_tokens", estimate_tokens(response_text))
+                    cached_tok = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
                     await self.ai_cache.log_usage(
                         ctx.channel.id, ctx.guild.id, "sclai",
                         in_tok, out_tok, answer_model)
 
                     if show_debug:
                         debug_parts.append(f"in={in_tok}")
+                        if cached_tok:
+                            debug_parts.append(f"cached={cached_tok}")
                         debug_parts.append(f"out={out_tok}")
+                        cost = calculate_cost(answer_model, in_tok, out_tok, cached_tok)
+                        debug_parts.append(f"${cost:.4f}")
                         debug_parts.append(answer_model.split("-")[1] if "-" in answer_model else answer_model)
 
         # Restore mentions so users get pinged
