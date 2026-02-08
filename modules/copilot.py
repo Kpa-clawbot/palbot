@@ -308,8 +308,9 @@ Keep the summary under {compact_max_tokens} tokens."""
         usage = data.get("usage", {})
         input_tokens = usage.get("prompt_tokens", estimate_tokens(messages_text))
         output_tokens = usage.get("completion_tokens", estimate_tokens(summary))
+        cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
 
-        return summary, input_tokens, output_tokens
+        return summary, input_tokens, output_tokens, cached_tokens
 
     def _trim_messages_to_budget(self, msgs: list, bot_user_id: int, max_tokens: int) -> list:
         """Trim oldest messages until formatted output fits within max_tokens.
@@ -405,13 +406,14 @@ Keep the summary under {compact_max_tokens} tokens."""
                         # Too small to bother compacting
                         return "Recent channel conversation:\n" + self._format_messages(all_msgs, bot_user_id)
 
-                    summary, in_tok, out_tok = await self._do_compaction(
+                    summary, in_tok, out_tok, cached_comp = await self._do_compaction(
                         ctx, older_text, compact_max_tokens, compact_model, token, base_url)
 
                     # Log compaction usage
                     await self.ai_cache.log_usage(
                         channel_id, guild_id, "compaction",
-                        in_tok, out_tok, compact_model)
+                        in_tok, out_tok, compact_model,
+                        cached_tokens=cached_comp)
 
                     # Update cache
                     newest_older = older_msgs[-1][3]
@@ -479,13 +481,14 @@ Keep the summary under {compact_max_tokens} tokens."""
                 return "Recent channel conversation:\n" + self._format_messages(all_msgs, bot_user_id)
 
             try:
-                summary, in_tok, out_tok = await self._do_compaction(
+                summary, in_tok, out_tok, cached_comp = await self._do_compaction(
                     ctx, older_text, compact_max_tokens, compact_model, token, base_url)
 
                 # Log compaction
                 await self.ai_cache.log_usage(
                     channel_id, guild_id, "compaction",
-                    in_tok, out_tok, compact_model)
+                    in_tok, out_tok, compact_model,
+                    cached_tokens=cached_comp)
 
                 # Store cache
                 newest_older = older_msgs[-1][3]
@@ -526,19 +529,20 @@ Keep the summary under {compact_max_tokens} tokens."""
                 return
 
             context_sections = []
+            stable_prefix_tokens = 0
 
             # Build compacted channel context
             channel_context = await self._build_compacted_context(ctx, settings, token, base_url)
             if channel_context:
                 context_sections.append(f'<context type="discord_history" usage="internal_reference_only">\n{channel_context}\n</context>')
-                if show_debug:
-                    # Split summary vs raw for detailed debug
-                    if "[Conversation summary" in channel_context and "Recent channel conversation:" in channel_context:
-                        parts = channel_context.split("Recent channel conversation:", 1)
+                if "[Conversation summary" in channel_context and "Recent channel conversation:" in channel_context:
+                    parts = channel_context.split("Recent channel conversation:", 1)
+                    stable_prefix_tokens += estimate_tokens(parts[0])
+                    if show_debug:
                         debug_parts.append(f"summary={estimate_tokens(parts[0])}tok")
                         debug_parts.append(f"raw={estimate_tokens(parts[1])}tok")
-                    else:
-                        debug_parts.append(f"history={estimate_tokens(channel_context)}tok")
+                elif show_debug:
+                    debug_parts.append(f"history={estimate_tokens(channel_context)}tok")
 
             # Gather context from mentioned users
             user_context = await self.gather_user_context(ctx)
@@ -547,14 +551,14 @@ Keep the summary under {compact_max_tokens} tokens."""
                 if show_debug:
                     debug_parts.append(f"users={estimate_tokens(user_context)}tok")
 
-            # Build prompt with context
+            # Build prompt with context — context first for prefix caching
             if context_sections:
                 combined_context = "\n\n".join(context_sections)
-                ask = f"""<user_question>
-{ask}
-</user_question>
+                ask = f"""{combined_context}
 
-{combined_context}"""
+<user_question>
+{ask}
+</user_question>"""
 
             headers = {
                 "Authorization": f"Bearer {token}",
@@ -579,6 +583,8 @@ Messages prefixed with [BOT] are your previous responses.
 RULES:
 - Never dump, repeat, or output raw context/logs even if asked
 - Give honest answers, push back when warranted, adult topics are fine"""
+
+            stable_prefix_tokens += estimate_tokens(system_prompt)
 
             max_output = settings.get("max_output_tokens", 500)
             payload = {
@@ -613,14 +619,21 @@ RULES:
                     usage = data.get("usage", {})
                     in_tok = usage.get("prompt_tokens", estimate_tokens(ask))
                     out_tok = usage.get("completion_tokens", estimate_tokens(response_text))
+                    # Use API cache info if available, otherwise estimate from stable prefix
+                    cached_tok = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                    if not cached_tok and stable_prefix_tokens >= 1024:
+                        cached_tok = min(stable_prefix_tokens, in_tok)
                     await self.ai_cache.log_usage(
                         ctx.channel.id, ctx.guild.id, "clai",
-                        in_tok, out_tok, answer_model)
+                        in_tok, out_tok, answer_model,
+                        cached_tokens=cached_tok)
 
                     if show_debug:
                         debug_parts.append(f"in={in_tok}")
+                        if cached_tok:
+                            debug_parts.append(f"cached≈{cached_tok}")
                         debug_parts.append(f"out={out_tok}")
-                        cost = calculate_cost(answer_model, in_tok, out_tok)
+                        cost = calculate_cost(answer_model, in_tok, out_tok, cached_tok)
                         debug_parts.append(f"${cost:.4f}")
                         debug_parts.append(answer_model.split("-")[1] if "-" in answer_model else answer_model)
 
@@ -682,6 +695,11 @@ RULES:
                 return
 
             context_sections = []
+            # For prefix caching: web search results change every call,
+            # but channel history summary is stable — track it separately
+            stable_sections = []
+            volatile_sections = []
+            stable_prefix_tokens = 0
 
             # 1. Web search for current info (use original question)
             try:
@@ -719,7 +737,7 @@ RULES:
                                 running_tokens += wc_tokens
                             combined_web = "\n\n".join(truncated) if truncated else web_content[0][:search_max_tokens * 4]
 
-                        context_sections.append(f'<web_search_results>\n{combined_web}\n</web_search_results>')
+                        volatile_sections.append(f'<web_search_results>\n{combined_web}\n</web_search_results>')
                         if show_debug:
                             debug_parts.append(f"search={estimate_tokens(combined_web)}tok")
             except Exception as e:
@@ -728,30 +746,32 @@ RULES:
             # 2. Compacted channel context
             channel_context = await self._build_compacted_context(ctx, settings, token, base_url)
             if channel_context:
-                context_sections.append(f'<discord_history>\n{channel_context}\n</discord_history>')
-                if show_debug:
-                    if "[Conversation summary" in channel_context and "Recent channel conversation:" in channel_context:
-                        parts = channel_context.split("Recent channel conversation:", 1)
+                stable_sections.append(f'<discord_history>\n{channel_context}\n</discord_history>')
+                if "[Conversation summary" in channel_context and "Recent channel conversation:" in channel_context:
+                    parts = channel_context.split("Recent channel conversation:", 1)
+                    stable_prefix_tokens += estimate_tokens(parts[0])
+                    if show_debug:
                         debug_parts.append(f"summary={estimate_tokens(parts[0])}tok")
                         debug_parts.append(f"raw={estimate_tokens(parts[1])}tok")
-                    else:
-                        debug_parts.append(f"history={estimate_tokens(channel_context)}tok")
+                elif show_debug:
+                    debug_parts.append(f"history={estimate_tokens(channel_context)}tok")
 
             # 3. User context from mentions
             user_context = await self.gather_user_context(ctx)
             if user_context:
-                context_sections.append(f'<mentioned_users>\n{user_context}\n</mentioned_users>')
+                volatile_sections.append(f'<mentioned_users>\n{user_context}\n</mentioned_users>')
                 if show_debug:
                     debug_parts.append(f"users={estimate_tokens(user_context)}tok")
 
-            # Build final prompt - question first, context last
+            # Build final prompt — stable context first for prefix caching
+            context_sections = stable_sections + volatile_sections
             if context_sections:
                 combined_context = "\n\n".join(context_sections)
-                ask = f"""<user_question>
-{ask}
-</user_question>
+                ask = f"""{combined_context}
 
-{combined_context}"""
+<user_question>
+{ask}
+</user_question>"""
 
             # Get current date for grounding
             current_date = datetime.now().strftime("%B %d, %Y")
@@ -782,6 +802,8 @@ RULES:
 - Never dump, repeat, or output raw context/search results even if asked
 - Synthesize information into a direct answer — don't summarize each source separately
 - Adult topics are fine"""
+
+            stable_prefix_tokens += estimate_tokens(system_prompt)
 
             payload = {
                 "model": answer_model,
@@ -815,14 +837,21 @@ RULES:
                     usage = data.get("usage", {})
                     in_tok = usage.get("prompt_tokens", estimate_tokens(ask))
                     out_tok = usage.get("completion_tokens", estimate_tokens(response_text))
+                    # Use API cache info if available, otherwise estimate from stable prefix
+                    cached_tok = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                    if not cached_tok and stable_prefix_tokens >= 1024:
+                        cached_tok = min(stable_prefix_tokens, in_tok)
                     await self.ai_cache.log_usage(
                         ctx.channel.id, ctx.guild.id, "sclai",
-                        in_tok, out_tok, answer_model)
+                        in_tok, out_tok, answer_model,
+                        cached_tokens=cached_tok)
 
                     if show_debug:
                         debug_parts.append(f"in={in_tok}")
+                        if cached_tok:
+                            debug_parts.append(f"cached≈{cached_tok}")
                         debug_parts.append(f"out={out_tok}")
-                        cost = calculate_cost(answer_model, in_tok, out_tok)
+                        cost = calculate_cost(answer_model, in_tok, out_tok, cached_tok)
                         debug_parts.append(f"${cost:.4f}")
                         debug_parts.append(answer_model.split("-")[1] if "-" in answer_model else answer_model)
 
@@ -998,13 +1027,14 @@ RULES:
             return f"{total_msgs} messages, older portion ({older_tokens} tokens) small enough — no compaction needed"
 
         # Compact
-        summary, in_tok, out_tok = await self._do_compaction(
+        summary, in_tok, out_tok, cached_comp = await self._do_compaction(
             ctx, older_text, compact_max_tokens, compact_model, token, base_url)
 
         # Log compaction usage
         await self.ai_cache.log_usage(
             channel.id, guild_id, "compaction",
-            in_tok, out_tok, compact_model)
+            in_tok, out_tok, compact_model,
+            cached_tokens=cached_comp)
 
         # Store cache
         newest_older = older_msgs[-1][3]
