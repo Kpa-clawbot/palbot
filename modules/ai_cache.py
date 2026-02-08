@@ -52,8 +52,10 @@ SETTINGS_SPEC = {
     "recompact_raw_hours": (12,  2,    72),
     "recompact_raw_tokens": (15000, 2000, 100000),
     "search_max_tokens":  (8000, 1000, 50000),
+    "max_output_tokens":  (500,  100,  4000),
     "answer_model":       ("claude-opus-4.6", None, None),
     "compact_model":      ("claude-sonnet-4.5", None, None),
+    "system_prompt":      ("", None, None),
 }
 
 # Hardcoded model pricing: (input $/M tokens, output $/M tokens)
