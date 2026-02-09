@@ -935,7 +935,10 @@ RULES:
             await ctx.send(output[:1980])
 
     async def brave_search(self, query: str, api_key: str, count: int = 5) -> list:
-        """Search using Brave Search API. Returns list of {title, link, snippet, page_text}."""
+        """Search using Brave Search API. Returns list of {title, link, snippet}.
+
+        Raises on non-200 responses so the caller can log the error and fall back.
+        """
         url = "https://api.search.brave.com/res/v1/web/search"
         headers = {"Accept": "application/json", "X-Subscription-Token": api_key}
         params = {"q": query, "count": count}
@@ -944,7 +947,8 @@ RULES:
             async with session.get(url, headers=headers, params=params,
                                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
-                    return []
+                    body = await resp.text()
+                    raise RuntimeError(f"Brave HTTP {resp.status}: {body[:200]}")
                 data = await resp.json()
 
         results = []
@@ -1012,11 +1016,24 @@ RULES:
             t0 = time.monotonic()
 
             # 1. Web search for current info (use original question)
+            search_engine = None
             try:
-                brave_key = await self.ai_cache.get_setting(guild_id, None, "brave_api_key")
+                brave_key = await self.ai_cache.get_setting(ctx.guild.id, None, "brave_api_key")
                 if brave_key:
-                    search_results = await self.brave_search(original_ask, brave_key, count=5)
+                    search_engine = "brave"
+                    try:
+                        search_results = await self.brave_search(original_ask, brave_key, count=5)
+                    except Exception as e:
+                        if show_debug:
+                            debug_parts.append(f"search:brave_err({type(e).__name__})")
+                        search_results = None
+                        # Fall back to Google
+                        search_engine = "google"
+                        search_results = await self.bot.utils.google_for_urls(
+                            self.bot, original_ask, return_full_data=True
+                        )
                 else:
+                    search_engine = "google"
                     search_results = await self.bot.utils.google_for_urls(
                         self.bot, original_ask, return_full_data=True
                     )
@@ -1054,8 +1071,12 @@ RULES:
 
                         volatile_sections.append(f'<web_search_results>\n{combined_web}\n</web_search_results>')
                         if show_debug:
-                            debug_parts.append(f"search={estimate_tokens(combined_web)}tok")
+                            debug_parts.append(f"search:{search_engine}={estimate_tokens(combined_web)}tok")
+                elif show_debug:
+                    debug_parts.append(f"search:{search_engine}=0")
             except Exception as e:
+                if show_debug:
+                    debug_parts.append(f"search:{search_engine or '?'}_err({type(e).__name__})")
                 self.bot.logger.error(f"sclai search failed: {e}")
 
             # 2. Compacted channel context
