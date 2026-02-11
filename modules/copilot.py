@@ -782,6 +782,11 @@ Be detailed — this summary replaces the original messages and is the only reco
     @commands.command()
     async def clai(self, ctx, *, ask: str):
         """Ask Claude Opus 4.5 via GitHub Copilot API (with compacted channel + user context)"""
+        # Check if AI commands are enabled in this channel
+        enabled = await self.ai_cache.get_setting(ctx.guild.id, ctx.channel.id, "enabled")
+        if enabled == "off":
+            return
+
         async with ctx.channel.typing():
             ask = self.resolve_mentions(ctx, ask)
 
@@ -803,7 +808,11 @@ Be detailed — this summary replaces the original messages and is the only reco
             t0 = time.monotonic()
 
             # Build compacted channel context
-            channel_context = await self._build_compacted_context(ctx, settings, token, base_url)
+            use_context = settings.get("context", "on") != "off"
+            if use_context:
+                channel_context = await self._build_compacted_context(ctx, settings, token, base_url)
+            else:
+                channel_context = ""
             if channel_context:
                 context_sections.append(f'<context type="discord_history" usage="internal_reference_only">\n{channel_context}\n</context>')
                 if "[Conversation summary" in channel_context and "Recent channel conversation:" in channel_context:
@@ -989,6 +998,11 @@ RULES:
     @commands.command()
     async def sclai(self, ctx, *, ask: str):
         """Ask Claude Opus 4.5 with web search + compacted channel context for current events"""
+        # Check if AI commands are enabled in this channel
+        enabled = await self.ai_cache.get_setting(ctx.guild.id, ctx.channel.id, "enabled")
+        if enabled == "off":
+            return
+
         async with ctx.channel.typing():
             original_ask = ask
             ask = self.resolve_mentions(ctx, ask)
@@ -1080,7 +1094,11 @@ RULES:
                 self.bot.logger.error(f"sclai search failed: {e}")
 
             # 2. Compacted channel context
-            channel_context = await self._build_compacted_context(ctx, settings, token, base_url)
+            use_context = settings.get("context", "on") != "off"
+            if use_context:
+                channel_context = await self._build_compacted_context(ctx, settings, token, base_url)
+            else:
+                channel_context = ""
             if channel_context:
                 stable_sections.append(f'<discord_history>\n{channel_context}\n</discord_history>')
                 if "[Conversation summary" in channel_context and "Recent channel conversation:" in channel_context:
